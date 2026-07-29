@@ -34,6 +34,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1789,36 +1790,76 @@ ffi::Module BuildTileLangMetal(IRModule mod, Target target) {
         }
       }
     }
-    // 5) Line-level: any line containing _shared → fix ALL pointer casts.
-    //    After passes 1-4, some casts still lack threadgroup because _shared
-    //    is nested inside the expression. This pass finds any (TYPE*) on a
-    //    _shared line and inserts the threadgroup qualifier if missing.
+    // 5) Line-level: fix pointer casts referencing threadgroup variables.
+    //
+    //    After passes 1-4, some casts still lack the threadgroup qualifier
+    //    because the shared buffer is nested inside the expression.
+    //    This pass first collects all threadgroup variable names from
+    //    declarations (e.g. "threadgroup half As[2048];"), then on any
+    //    line referencing one of those names, finds all (TYPE*) casts
+    //    that are missing the qualifier and inserts "threadgroup".
     {
-      std::istringstream iss(fsource);
-      std::ostringstream oss;
-      std::string line;
-      while (std::getline(iss, line)) {
-        if (line.find("_shared") != std::string::npos) {
-          for (size_t i = 0; i + 3 < line.length(); i++) {
-            if (line[i] == '(') {
-              if (line.substr(i, 14) == "(threadgroup ") {
-                i += 13;
-                continue;
-              }
-              size_t j = i + 1;
-              while (j < line.length() && (isalnum(line[j]) || line[j] == '_'))
-                j++;
-              if (j < line.length() && line[j] == '*' &&
-                  j + 1 < line.length() && line[j + 1] == ')') {
-                line.insert(i + 1, "threadgroup ");
-                i += 12;
-              }
+      // Collect threadgroup buffer names from declarations
+      std::unordered_set<std::string> tg_names;
+      {
+        std::istringstream decl_iss(fsource);
+        std::string decl_line;
+        while (std::getline(decl_iss, decl_line)) {
+          // Match: "threadgroup TYPE name[size];"
+          if (decl_line.find("threadgroup ") != std::string::npos) {
+            size_t p = decl_line.find("threadgroup ");
+            p += 12;  // skip "threadgroup "
+            // skip type name (may contain spaces, e.g. "simdgroup_half8x8")
+            while (p < decl_line.length() && decl_line[p] != ' ') p++;
+            while (p < decl_line.length() && decl_line[p] == ' ') p++;
+            size_t name_start = p;
+            while (p < decl_line.length() &&
+                   (isalnum(decl_line[p]) || decl_line[p] == '_')) p++;
+            if (p > name_start && p < decl_line.length() &&
+                decl_line[p] == '[') {
+              tg_names.insert(
+                  decl_line.substr(name_start, p - name_start));
             }
           }
         }
-        oss << line << "\n";
       }
-      fsource = oss.str();
+
+      if (!tg_names.empty()) {
+        std::istringstream iss(fsource);
+        std::ostringstream oss;
+        std::string line;
+        while (std::getline(iss, line)) {
+          // Check if this line references any threadgroup variable
+          bool has_tg_var = false;
+          for (const auto &name : tg_names) {
+            if (line.find(name) != std::string::npos) {
+              has_tg_var = true;
+              break;
+            }
+          }
+          if (has_tg_var) {
+            for (size_t i = 0; i + 3 < line.length(); i++) {
+              if (line[i] == '(') {
+                if (line.substr(i, 14) == "(threadgroup ") {
+                  i += 13;
+                  continue;
+                }
+                size_t j = i + 1;
+                while (j < line.length() &&
+                       (isalnum(line[j]) || line[j] == '_'))
+                  j++;
+                if (j < line.length() && line[j] == '*' &&
+                    j + 1 < line.length() && line[j + 1] == ')') {
+                  line.insert(i + 1, "threadgroup ");
+                  i += 12;
+                }
+              }
+            }
+          }
+          oss << line << "\n";
+        }
+        fsource = oss.str();
+      }
     }
     source_maker << fsource << "\n";
     if (fmetal_postproc) {
