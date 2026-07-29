@@ -1799,26 +1799,33 @@ ffi::Module BuildTileLangMetal(IRModule mod, Target target) {
     //    line referencing one of those names, finds all (TYPE*) casts
     //    that are missing the qualifier and inserts "threadgroup".
     {
-      // Collect threadgroup buffer names from declarations
+      // Collect threadgroup buffer names from declarations.
+      // Matches both array and pointer forms:
+      //   threadgroup half As[2048];
+      //   threadgroup void* As = ...;
       std::unordered_set<std::string> tg_names;
       {
         std::istringstream decl_iss(fsource);
         std::string decl_line;
         while (std::getline(decl_iss, decl_line)) {
-          // Match: "threadgroup TYPE name[size];"
-          if (decl_line.find("threadgroup ") != std::string::npos) {
-            size_t p = decl_line.find("threadgroup ");
-            p += 12;  // skip "threadgroup "
-            // skip type name (may contain spaces, e.g. "simdgroup_half8x8")
-            while (p < decl_line.length() && decl_line[p] != ' ') p++;
-            while (p < decl_line.length() && decl_line[p] == ' ') p++;
-            size_t name_start = p;
-            while (p < decl_line.length() &&
-                   (isalnum(decl_line[p]) || decl_line[p] == '_')) p++;
-            if (p > name_start && p < decl_line.length() &&
-                decl_line[p] == '[') {
-              tg_names.insert(
-                  decl_line.substr(name_start, p - name_start));
+          if (decl_line.find("threadgroup ") == std::string::npos)
+            continue;
+          // Find any [ ; or = and backtrack to the preceding alnum token.
+          for (size_t p = 0; p < decl_line.length(); p++) {
+            if (decl_line[p] == '[' || decl_line[p] == ';' ||
+                decl_line[p] == '=') {
+              // Backtrack past spaces
+              size_t end = p;
+              while (end > 0 && decl_line[end - 1] == ' ') end--;
+              // Backtrack past alnum / underscore
+              size_t start = end;
+              while (start > 0 &&
+                     (isalnum(decl_line[start - 1]) ||
+                      decl_line[start - 1] == '_'))
+                start--;
+              if (start < end) {
+                tg_names.insert(decl_line.substr(start, end - start));
+              }
             }
           }
         }
@@ -1902,6 +1909,71 @@ ffi::Module BuildTileLangMetalWithoutCompile(IRModule mod, Target target) {
     cg.AddFunction(kv.first, f);
 
     std::string fsource = cg.Finish();
+
+    // Apply pass 5: fix threadgroup casts using declaration analysis.
+    // (Same logic as in BuildTileLangMetal above.)
+    {
+      std::unordered_set<std::string> tg_names;
+      {
+        std::istringstream decl_iss(fsource);
+        std::string decl_line;
+        while (std::getline(decl_iss, decl_line)) {
+          if (decl_line.find("threadgroup ") == std::string::npos)
+            continue;
+          for (size_t p = 0; p < decl_line.length(); p++) {
+            if (decl_line[p] == '[' || decl_line[p] == ';' ||
+                decl_line[p] == '=') {
+              size_t end = p;
+              while (end > 0 && decl_line[end - 1] == ' ') end--;
+              size_t start = end;
+              while (start > 0 &&
+                     (isalnum(decl_line[start - 1]) ||
+                      decl_line[start - 1] == '_'))
+                start--;
+              if (start < end) {
+                tg_names.insert(decl_line.substr(start, end - start));
+              }
+            }
+          }
+        }
+      }
+      if (!tg_names.empty()) {
+        std::istringstream iss(fsource);
+        std::ostringstream oss;
+        std::string line;
+        while (std::getline(iss, line)) {
+          bool has_tg_var = false;
+          for (const auto &name : tg_names) {
+            if (line.find(name) != std::string::npos) {
+              has_tg_var = true;
+              break;
+            }
+          }
+          if (has_tg_var) {
+            for (size_t i = 0; i + 3 < line.length(); i++) {
+              if (line[i] == '(') {
+                if (line.substr(i, 14) == "(threadgroup ") {
+                  i += 13;
+                  continue;
+                }
+                size_t j = i + 1;
+                while (j < line.length() &&
+                       (isalnum(line[j]) || line[j] == '_'))
+                  j++;
+                if (j < line.length() && line[j] == '*' &&
+                    j + 1 < line.length() && line[j + 1] == ')') {
+                  line.insert(i + 1, "threadgroup ");
+                  i += 12;
+                }
+              }
+            }
+          }
+          oss << line << "\n";
+        }
+        fsource = oss.str();
+      }
+    }
+
     source_maker << fsource << "\n";
     smap.Set(func_name, ffi::Bytes(std::move(fsource)));
   }
