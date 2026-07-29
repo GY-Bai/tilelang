@@ -639,9 +639,15 @@ void CodeGenTileLangMetal::VisitStmt_(const ForNode *op) {
     }
     return;
   }
-  if (ext_imm && ext_imm->value > 4) {
+  if (ext_imm && ext_imm->value > 8) {
     PrintIndent();
     stream << "#pragma clang loop unroll(disable)\n";
+  } else if (ext_imm && ext_imm->value > 1) {
+    // Small constant-bound loops: encourage full unroll (like MLX's STEEL_PRAGMA_UNROLL).
+    // Apple GPU compiler manages these efficiently; leaving them un-unrolled adds branch
+    // overhead in inner GEMM/warp/MMA loops.
+    PrintIndent();
+    stream << "#pragma clang loop unroll(full)\n";
   }
   CodeGenC::VisitStmt_(op);
 }
